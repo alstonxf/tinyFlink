@@ -3,76 +3,92 @@ import java.util.concurrent.*;
 import java.util.function.Consumer;
 
 /**
- * MiniFlink - 一个极简的“流处理引擎”示例
+ * TinyFlink - 一个极简的“流处理引擎”示例
  *
- * Features:
- * - Stream API: fromElements(...).map(...).filter(...).print().execute()
- * - Operator chain: 每个 operator 将输出直接 push 到下游 (同步调用)
- * - Source 支持同步推送或异步推送（演示用）
+ * 功能特点：
+ * - 支持链式 API: fromElements(...).map(...).filter(...).print().execute()
+ * - Operator chain：每个算子处理完数据后直接同步推送给下游
+ * - Source 支持两种执行模式：同步批量推送、异步定时推送（模拟流式数据）
  *
- * 目的：帮助理解 Flink 中的 StreamTask、OperatorChain、StreamRecord、算子链等概念
+ * 目标：
+ *   用最小实现演示 Flink 中核心概念：
+ *   - StreamRecord（流事件封装，包含 value + timestamp）
+ *   - Operator（算子接口）
+ *   - OperatorChain（算子链）
+ *   - Source → Transformation → Sink 的完整执行流程
  */
 public class TinyFlink {
 
     /* --------------------------
-     * API 接口与基础类型
+     * 核心数据结构和函数接口
      * -------------------------- */
 
-    // 包装流记录（保留扩展点，如 timestamp 等）
+    // StreamRecord：对流中的一条数据进行封装，带上时间戳
     public static class StreamRecord<T> {
         public final T value;
         public final long timestamp;
-        public StreamRecord(T value) { this(value, System.currentTimeMillis()); }
-        public StreamRecord(T value, long ts) { this.value = value; this.timestamp = ts; }
-        public String toString(){ return "StreamRecord(" + value + ", ts=" + timestamp + ")"; }
+        public StreamRecord(T value) {
+            this(value, System.currentTimeMillis()); // 默认用当前时间戳
+        }
+        public StreamRecord(T value, long ts) {
+            this.value = value;
+            this.timestamp = ts;
+        }
+        public String toString(){
+            return "StreamRecord(" + value + ", ts=" + timestamp + ")";
+        }
     }
 
-    // Map 函数接口
+    // Map 函数接口：接收一个输入值，返回一个输出值
     public static interface MapFunction<IN, OUT> {
         OUT map(IN value) throws Exception;
     }
 
-    // Filter 函数接口
+    // Filter 函数接口：接收一个输入值，返回是否保留
     public static interface FilterFunction<T> {
         boolean filter(T value) throws Exception;
     }
 
-    // 抽象算子：接收 StreamRecord<Object>，处理后 push 到下游
+    // 抽象算子：所有算子都继承自它
     public static abstract class Operator {
+        // 下游消费者（Consumer 接口），接收上游处理后的 StreamRecord
         protected Consumer<StreamRecord<?>> downstream;
-
-        public Operator() {}
 
         public void setDownstream(Consumer<StreamRecord<?>> downstream) {
             this.downstream = downstream;
         }
 
-        // 处理来自上游的元素
+        // 处理来自上游的数据
         public abstract void process(StreamRecord<?> record) throws Exception;
     }
 
     /* --------------------------
-     * 具体算子实现
+     * 算子实现：Map / Filter / Sink
      * -------------------------- */
 
-    // Map 算子
+    // Map 算子：对输入值做转换
     public static class MapOperator<IN, OUT> extends Operator {
         private final MapFunction<IN, OUT> func;
 
-        public MapOperator(MapFunction<IN, OUT> f) { this.func = f; }
+        public MapOperator(MapFunction<IN, OUT> f) {
+            this.func = f;
+        }
 
         @SuppressWarnings("unchecked")
         @Override
         public void process(StreamRecord<?> record) throws Exception {
+            // 强转为输入类型
             IN in = (IN) record.value;
+            // 调用用户函数 map
             OUT out = func.map(in);
+            // 封装为新的 StreamRecord 并推送下游
             if (downstream != null) {
                 downstream.accept(new StreamRecord<>(out, record.timestamp));
             }
         }
     }
 
-    // Filter 算子
+    // Filter 算子：根据条件保留或丢弃数据
     public static class FilterOperator<T> extends Operator {
         private final FilterFunction<T> func;
 
@@ -82,13 +98,14 @@ public class TinyFlink {
         @Override
         public void process(StreamRecord<?> record) throws Exception {
             T in = (T) record.value;
+            // 通过条件则继续传递
             if (func.filter(in)) {
                 if (downstream != null) downstream.accept(record);
             }
         }
     }
 
-    // Sink：打印输出
+    // Sink：打印输出（终点）
     public static class PrintSink extends Operator {
         @Override
         public void process(StreamRecord<?> record) {
@@ -101,34 +118,32 @@ public class TinyFlink {
      * -------------------------- */
 
     public static class Stream<T> {
-        // head 是第一个 operator（可以是 source 直接 push 的入口）
+        // head：第一个算子（source 会推数据进 head）
         private Operator head;
-        // tail 是当前链的尾 operator（方便拼接下一个算子）
+        // tail：链的尾部（便于新增算子时接上）
         private Operator tail;
+
+        // 存放 source 的初始元素（同步或异步执行时用）
+        private List<T> sourceElements;
 
         private Stream() {}
 
-        // 从元素创建一个同步 source
+        // 创建一个流（Source）——直接从一组元素构建
         @SafeVarargs
         public static <T> Stream<T> fromElements(T... elements) {
             Stream<T> s = new Stream<>();
-            // source 算子：它不是 Operator 的子类，为了简化直接把 head 设为 null，
-            // 实际上我们会保存元素到 sourceElements，并在 execute() 时推送
             s.sourceElements = Arrays.asList(elements);
             return s;
         }
 
-        // 内部存放 source 数据（简化模型）
-        private List<T> sourceElements;
-
-        // 添加 map 算子
+        // 添加 map 算子，并返回新的 Stream（泛型类型切换）
         public <R> Stream<R> map(MapFunction<T, R> mapFunc) {
             MapOperator<T, R> mapOp = new MapOperator<>(mapFunc);
             attachOperator(mapOp);
             Stream<R> next = new Stream<>();
-            next.head = this.head;
-            next.tail = mapOp;
-            next.sourceElements = (List<R>) this.sourceElements;
+            next.head = this.head;         // 继承原链 head
+            next.tail = mapOp;             // 新的链尾
+            next.sourceElements = (List<R>) this.sourceElements; // 共用 source
             return next;
         }
 
@@ -140,7 +155,7 @@ public class TinyFlink {
             return this;
         }
 
-        // 添加 print sink
+        // 添加 sink：print
         public Stream<T> print() {
             PrintSink sink = new PrintSink();
             attachOperator(sink);
@@ -148,16 +163,15 @@ public class TinyFlink {
             return this;
         }
 
-        // 将 operator 连接到链尾
+        // 将算子接到链尾
         private void attachOperator(Operator op) {
             if (head == null) {
-                // 首次 attach：head 和 tail 都指向 op
+                // 首次添加算子：直接作为 head & tail
                 head = op;
                 tail = op;
             } else {
-                // 将当前 tail 的 downstream 设置为一个 Consumer，负责把 StreamRecord push 到下游 op.process(...)
+                // 把上一个 tail 的 downstream 设置为调用下一个算子
                 Operator prev = tail;
-                // 创建 downstream Consumer：调用下一个算子的 process（同步）
                 prev.setDownstream(rec -> {
                     try {
                         op.process(rec);
@@ -170,14 +184,12 @@ public class TinyFlink {
             }
         }
 
-        // 执行：将 source 的元素逐个推送到算子链 head（同步）
+        // 同步执行：一次性推送所有 source 元素
         public void execute() {
             if (head == null) {
                 System.out.println("No operators attached. Nothing to execute.");
                 return;
             }
-
-            // 将每个 element 包装成 StreamRecord 推给 head（head 的 process 实现会将其下发）
             for (T e : sourceElements) {
                 StreamRecord<T> rec = new StreamRecord<>(e);
                 try {
@@ -188,7 +200,7 @@ public class TinyFlink {
             }
         }
 
-        // 支持异步 source：把元素放到线程池，模拟流式到来（可选）
+        // 异步执行：定时推送 source 元素，模拟“流”
         public void executeAsync(long intervalMillis) {
             if (head == null) {
                 System.out.println("No operators attached. Nothing to execute.");
@@ -196,6 +208,7 @@ public class TinyFlink {
             }
             ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor();
             final Iterator<T> it = sourceElements.iterator();
+            // 每隔 intervalMillis 发送一个元素
             exec.scheduleAtFixedRate(() -> {
                 if (!it.hasNext()) {
                     exec.shutdown();
@@ -209,7 +222,7 @@ public class TinyFlink {
                     ex.printStackTrace();
                 }
             }, 0, intervalMillis, TimeUnit.MILLISECONDS);
-            // 等待结束（简单处理）
+            // 简单等待任务结束（防止主线程退出）
             try {
                 exec.awaitTermination(10, TimeUnit.SECONDS);
             } catch (InterruptedException ie) {
@@ -226,16 +239,16 @@ public class TinyFlink {
         // Example 1: 同步执行
         System.out.println("== Sync execution ==");
         Stream.fromElements(1,2,3,4,5)
-                .map((Integer x) -> x * 2)        // map: int -> int
-                .filter((Integer x) -> x % 4 == 0) // filter: 保留能被4整除的
-                .print()                           // sink: 打印
+                .map((Integer x) -> x * 2)         // map: 把每个数字 *2
+                .filter((Integer x) -> x % 4 == 0) // filter: 只保留能被4整除的
+                .print()                           // sink: 打印输出
                 .execute();
 
-        // Example 2: 异步/间隔流式执行（每 200ms 发一个）
+        // Example 2: 异步执行（每隔 200ms 发送一条数据）
         System.out.println("\n== Async (interval) execution ==");
         Stream.fromElements("a","bb","ccc","dddd")
-                .map((String s) -> s + "[" + s.length() + "]")
-                .print()
+                .map((String s) -> s + "[" + s.length() + "]") // 拼接字符串 + 长度
+                .print()                                       // sink: 打印
                 .executeAsync(200);
     }
 }

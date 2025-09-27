@@ -1,3 +1,24 @@
+
+# 编译输出目录
 target/
 *.class
+
+# IDEA 配置
 .idea/
+*.iml
+*.iws
+
+# Eclipse 配置（如果有人用 Eclipse 打开过）
+.project
+.classpath
+.settings/
+
+# Mac OS
+.DS_Store
+
+# 日志文件
+*.log
+
+# 临时文件
+*.swp
+*~
